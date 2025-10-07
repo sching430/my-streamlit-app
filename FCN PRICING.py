@@ -29,10 +29,19 @@ def _derive_constants(S0, notional, tenor, coupon_pa, r, q, sigma, td_per_year, 
     else:
         ko_start_idx = 1
     ko_start_idx = int(np.clip(ko_start_idx, 1, M))
+
+    # -------- NEW: plain "no-option" fixed-leg PVs (for explicit option premium) --------
+    pv_plain_coupons = float(C * disc_months.sum())      # coupons always paid to maturity
+    pv_plain_redemption = float(notional * disc_T)       # redemption at T (no KO/KI)
+    pv_plain_total = pv_plain_coupons + pv_plain_redemption
+
     return dict(
         dt=dt, M=M, mu_log=mu_log, sig_step=sig_step, H=H, KKI=KKI,
         t_months=t_months, k_months=k_months, disc_months=disc_months, C=C, disc_T=disc_T,
-        ko_start_idx=ko_start_idx
+        ko_start_idx=ko_start_idx,
+        pv_plain_coupons=pv_plain_coupons,
+        pv_plain_redemption=pv_plain_redemption,
+        pv_plain_total=pv_plain_total
     )
 
 def _sample_path_table(S0, consts, Z_row):
@@ -340,9 +349,11 @@ if run:
         st.markdown("### Derived variables")
         deriv_df = pd.DataFrame({
             "Metric": ["Δt", "Steps M", "KO level H", "KI level K_KI", "Monthly coupon C",
-                       "Coupon months", "Coupon day indices (k_m)", "Earliest KO day index (daily mode)"],
+                       "Coupon months", "Coupon day indices (k_m)", "Earliest KO day index (daily mode)",
+                       "PV_plain_coupons (no options)", "PV_plain_redemption (no options)", "PV_plain_total (no options)"],
             "Value": [consts['dt'], consts['M'], consts['H'], consts['KKI'], consts['C'],
-                      len(consts['t_months']), ", ".join(map(str, consts['k_months'].tolist())), consts['ko_start_idx']]
+                      len(consts['t_months']), ", ".join(map(str, consts['k_months'].tolist())), consts['ko_start_idx'],
+                      consts['pv_plain_coupons'], consts['pv_plain_redemption'], consts['pv_plain_total']]
         })
         st.dataframe(deriv_df, use_container_width=True, column_config={
             "Δt": st.column_config.NumberColumn("Δt", help="Trading-day step size: 1 / (trading days per year)."),
@@ -352,7 +363,10 @@ if run:
             "Monthly coupon C": st.column_config.NumberColumn("Monthly coupon C", help="Coupon per month = Notional × (coupon p.a.) / 12."),
             "Coupon months": st.column_config.NumberColumn("Coupon months", help="Number of months within the tenor."),
             "Coupon day indices (k_m)": st.column_config.TextColumn("Coupon day indices (k_m)", help="Nearest daily indices used for coupon dates."),
-            "Earliest KO day index (daily mode)": st.column_config.NumberColumn("Earliest KO day index (daily mode)", help="When KO checks start if daily observation is selected and deferral > 0.")
+            "Earliest KO day index (daily mode)": st.column_config.NumberColumn("Earliest KO day index (daily mode)", help="When KO checks start if daily observation is selected and deferral > 0."),
+            "PV_plain_coupons (no options)": st.column_config.NumberColumn("PV_plain_coupons (no options)"),
+            "PV_plain_redemption (no options)": st.column_config.NumberColumn("PV_plain_redemption (no options)"),
+            "PV_plain_total (no options)": st.column_config.NumberColumn("PV_plain_total (no options)")
         })
 
         schedule = pd.DataFrame({
@@ -363,12 +377,7 @@ if run:
             "Coupon C": consts['C']
         })
         st.markdown("#### Monthly coupon schedule")
-        st.dataframe(schedule, use_container_width=True, column_config={
-            "t_m (years)": st.column_config.NumberColumn("t_m (years)", help="Coupon time in years since trade date."),
-            "k_m (day index)": st.column_config.NumberColumn("k_m (day index)", help="Nearest trading-day index."),
-            "df e^{-r t_m}": st.column_config.NumberColumn("df e^{-r t_m}", help="Discount factor to coupon date using r."),
-            "Coupon C": st.column_config.NumberColumn("Coupon C", help="Fixed monthly coupon amount.")
-        })
+        st.dataframe(schedule, use_container_width=True)
 
     # ---------- Sheet 2: Deterministic GBM ----------
     with tab_det:
@@ -426,8 +435,23 @@ if run:
         c2.metric("Redemption PV (mean)", f"{results['pv_redemption_mean']:,.2f}",
                   help="Expected present value of redemption: at KO time if KO occurs, else at maturity using the KI rule.")
         total_price = results['pv_coupons_mean'] + results['pv_redemption_mean']
-        c3.metric("Total price", f"{total_price:,.2f}",
-                  help="Coupons PV + Redemption PV. Equals the Price on the Results tab.")
+        c3.metric("Total price (MC fair value)", f"{total_price:,.2f}",
+                  help="Coupons PV + Redemption PV.")
+
+        # -------- NEW: explicit embedded option premium (investor view) --------
+        option_premium = total_price - consts['pv_plain_total']
+        st.markdown("#### Embedded option premium (investor view)")
+        st.metric("Option premium = MC fair value − Plain fixed-leg PV",
+                  f"{option_premium:,.2f}",
+                  help="Plain legs assume coupons all months to T and redemption at T (no KO/KI).")
+
+        # Table comparing plain vs MC
+        comp_df = pd.DataFrame({
+            "Component": ["Coupons PV", "Redemption PV", "Total"],
+            "Plain (no options)": [consts['pv_plain_coupons'], consts['pv_plain_redemption'], consts['pv_plain_total']],
+            "Monte Carlo (with KO/KI)": [results['pv_coupons_mean'], results['pv_redemption_mean'], total_price]
+        })
+        st.dataframe(comp_df, use_container_width=True)
 
     # ---------- Sheet 5: Results ----------
     with tab_results:
@@ -455,15 +479,35 @@ if run:
 
     # ---------- Sheet 6: Cash-in vs Cash-out ----------
     with tab_par:
-        st.markdown("### Par check")
-        fair_pct = 100.0 * results['price'] / notional
+        st.markdown("### Cash-in vs Cash-out (at PAR today)")
+        fair_price = results['price']
+        fair_pct = 100.0 * fair_price / notional
+        issuer_margin = notional - fair_price
+
+        # Show detailed components
         e1, e2, e3 = st.columns(3)
-        e1.metric("Fair price", f"{results['price']:,.2f}",
+        e1.metric("Cash-in today (Issue price)", f"{notional:,.2f}", help="Assumes issuance at par today.")
+        e2.metric("Cash-out PV today (MC fair value)", f"{fair_price:,.2f}",
                   help="Discounted expectation of contractual cashflows under Q.")
-        e2.metric("% of par", f"{fair_pct:.2f}%",
-                  help="Fair price divided by Notional × 100%.")
-        e3.metric("Issuer margin @ par", f"{(notional - results['price']):,.2f}",
-                  help="If the note is sold at par today, this is Par − Fair Value.")
+        e3.metric("Issuer margin @ par", f"{issuer_margin:,.2f}",
+                  help="Par − MC fair value (positive = issuer surplus at par).")
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("% of par (fair value)", f"{fair_pct:.2f}%", help="MC fair value ÷ Notional × 100%.")
+        f2.metric("Coupons PV component", f"{results['pv_coupons_mean']:,.2f}",
+                  help="Part of the cash-out PV attributable to coupons.")
+        f3.metric("Redemption PV component", f"{results['pv_redemption_mean']:,.2f}",
+                  help="Part of the cash-out PV attributable to redemption.")
+
+        # -------- NEW: expose option premium also in this tab --------
+        st.markdown("#### Embedded option view")
+        st.write(
+            f"Plain fixed legs PV (no options): **{consts['pv_plain_total']:,.2f}**  "
+            f"(Coupons **{consts['pv_plain_coupons']:,.2f}**, Redemption **{consts['pv_plain_redemption']:,.2f}**)"
+        )
+        opt_premium = fair_price - consts['pv_plain_total']
+        st.write(f"Embedded option premium (investor view): **{opt_premium:,.2f}**  "
+                 f"(issuer view: **{-opt_premium:,.2f}**).")
 
     # ---------- Sheet 7: Help / How this works ----------
     with tab_help:
@@ -491,11 +535,19 @@ if run:
 
         **Antithetic variates**  
         We value both +Z and −Z legs to reduce variance. The app averages over the **valued legs** (2×paths when ON).
+
+        **Embedded option premium**  
+        Plain fixed-leg PV (no KO/KI) = C·∑e^{−rt_m} + N·e^{−rT}.  
+        Embedded option premium (investor view) = MC fair value − Plain PV.  
+        Typically negative for FCNs (investor sells downside optionality to fund coupons). 
         """)
 
     # ---------- Download workbook ----------
     st.markdown("---")
     st.markdown("### Export")
+    total_price = results['pv_coupons_mean'] + results['pv_redemption_mean']
+    option_premium = total_price - consts['pv_plain_total']
+
     sheets = {
         "Inputs": inputs_df,
         "Derived": deriv_df,
@@ -507,12 +559,24 @@ if run:
         "Z_Diagnostics": pd.DataFrame({"Metric": ["mean(Z)", "sd(Z)"], "Value": [results['z_mean'], results['z_sd']]}),
         "SamplePath": ensure_df(results['sample_path_df']),
         "PV_Components": pd.DataFrame({
-            "Component": ["Coupons PV (mean)", "Redemption PV (mean)", "Total Price"],
+            "Component": ["Coupons PV (mean)", "Redemption PV (mean)", "Total Price (MC)"],
             "Value": [results['pv_coupons_mean'], results['pv_redemption_mean'], total_price]
+        }),
+        "Plain_vs_MC": pd.DataFrame({
+            "Component": ["Coupons PV", "Redemption PV", "Total"],
+            "Plain (no options)": [consts['pv_plain_coupons'], consts['pv_plain_redemption'], consts['pv_plain_total']],
+            "Monte Carlo (with KO/KI)": [results['pv_coupons_mean'], results['pv_redemption_mean'], total_price],
+            "Option premium (MC − Plain)": ["", "", option_premium]
         }),
         "Results": pd.DataFrame({
             "Metric": ["Price", "Std Error", "95% CI low", "95% CI high", "KO probability", "Average coupons", "Expected life (years)", "Prob(ST < KI | no KO)"],
             "Value": [results['price'], results['se'], results['price']-1.96*results['se'], results['price']+1.96*results['se'], results['ko_prob'], results['avg_coupons'], results['expected_life'], results['prob_ST_below_KI_noKO']]
+        }),
+        "CashInOut": pd.DataFrame({
+            "Metric": ["Cash-in today (par)", "Coupons PV (MC)", "Redemption PV (MC)", "Cash-out PV total (MC fair value)", "Issuer margin @ par",
+                       "Plain PV coupons (no options)", "Plain PV redemption (no options)", "Plain PV total (no options)", "Embedded option premium (investor)"],
+            "Value": [notional, results['pv_coupons_mean'], results['pv_redemption_mean'], total_price, notional - total_price,
+                      consts['pv_plain_coupons'], consts['pv_plain_redemption'], consts['pv_plain_total'], option_premium]
         }),
         "ParCheck": pd.DataFrame({
             "Metric": ["Fair price", "% of par", "Issuer margin @ par"],
